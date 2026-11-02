@@ -1,0 +1,429 @@
+/*
+  ESP32-S3  |  USD / SYP monitor
+  ---------------------------------------------------------------
+  Source  : sp-today.com (الليرة اليوم) - US dollar page
+  Display : 16x2 LCD (HD44780, 16-pin parallel) in 4-bit mode
+  LEDs    : GREEN = dollar rising, RED = dollar falling
+            (the last direction stays lit while the market is closed)
+  Refresh : every 30 seconds
+  Board   : "ESP32S3 Dev Module"     Library: LiquidCrystal (built-in)
+
+  Wiring
+    LCD  1 VSS -> GND         2 VDD -> 5V         3 V0 -> 10k pot (contrast)
+         4 RS  -> GPIO4       5 RW  -> GND        6 E  -> GPIO5
+         7-10 (D0-D3) -> not connected
+         11 D4 -> GPIO6   12 D5 -> GPIO7   13 D6 -> GPIO15   14 D7 -> GPIO16
+         15 A -> 5V (via 220R if the module has no resistor)   16 K -> GND
+    Green LED -> GPIO17 -> 220R -> GND
+    Red   LED -> GPIO18 -> 220R -> GND
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <LiquidCrystal.h>
+#include <Preferences.h>
+#include <time.h>
+#include <math.h>
+#include <ctype.h>
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+// ===================== USER SETTINGS =====================
+const char* WIFI_SSID = "shadow";
+const char* WIFI_PASS = "shadi.an.net";
+
+const char*    PAGE_URL   = "https://sp-today.com/en/currency/us-dollar";
+const uint32_t REFRESH_MS = 30000;      // 30 seconds
+
+const bool SHOW_OLD_LIRA = false;       // false -> 143.75     true -> 14375
+
+// Used ONLY if the page has no market-status text (Damascus time, UTC+3)
+const int MARKET_OPEN_HOUR  = 10;
+const int MARKET_CLOSE_HOUR = 18;
+
+// ===================== PINS =====================
+const int PIN_RS = 4, PIN_E = 5, PIN_D4 = 6, PIN_D5 = 7, PIN_D6 = 15, PIN_D7 = 16;
+const int PIN_LED_GREEN = 17;
+const int PIN_LED_RED   = 18;
+
+// ---- PARSER BEGIN ------------------------------------------------------
+struct Quote {
+  float  buy = NAN, sell = NAN;
+  float  pct = NAN;          // signed daily change in %, NAN if unknown
+  int8_t dir = 0;            // +1 up, -1 down, 0 flat
+  bool   dirFound = false;   // the page showed a direction (sign or arrow)
+  int8_t market = -1;        // -1 unknown, 0 closed, 1 open (only if the page says so)
+};
+
+// first number after p (skips up to 40 non-digits); thousands commas removed
+static float numberAfter(const char* p, const char** endp) {
+  int skipped = 0;
+  while (*p && !isdigit((unsigned char)*p)) {
+    if (++skipped > 40) { *endp = p; return NAN; }
+    p++;
+  }
+  char buf[16];
+  int k = 0;
+  while (*p && (isdigit((unsigned char)*p) || *p == '.' || *p == ',')) {
+    if (*p != ',' && k < 15) buf[k++] = *p;
+    p++;
+  }
+  buf[k] = 0;
+  *endp = p;
+  return k ? (float)atof(buf) : NAN;
+}
+
+static bool hasUp(const char* s) {      // triangle up
+  return strstr(s, "\xE2\x96\xB2") || strstr(s, "&#9650;") || strstr(s, "&#x25B2;") || strstr(s, "&#x25b2;");
+}
+static bool hasDown(const char* s) {    // triangle down
+  return strstr(s, "\xE2\x96\xBC") || strstr(s, "&#9660;") || strstr(s, "&#x25BC;") || strstr(s, "&#x25bc;");
+}
+
+static const char* findCI(const char* h, const char* n) {
+  size_t ln = strlen(n);
+  for (; *h; h++) if (strncasecmp(h, n, ln) == 0) return h;
+  return nullptr;
+}
+
+// market status written in the page text, if any: 1 open, 0 closed, -1 not found
+static int8_t findMarket(const char* t) {
+  const char* openKeys[]   = {"market open", "market is open", "market: open", "السوق مفتوح", "السوق: مفتوح"};
+  const char* closedKeys[] = {"market closed", "market is closed", "market: closed", "السوق مغلق", "السوق: مغلق"};
+  const char *bo = nullptr, *bc = nullptr;
+  for (const char* k : openKeys)   { const char* p = findCI(t, k); if (p && (!bo || p < bo)) bo = p; }
+  for (const char* k : closedKeys) { const char* p = findCI(t, k); if (p && (!bc || p < bc)) bc = p; }
+  if (bo && (!bc || bo < bc)) return 1;
+  if (bc) return 0;
+  return -1;
+}
+
+// text (tags already removed) looks like:
+// "... Buy 142.75SYP (new) 14,275 old Sell 143.50SYP (new) ... Change ▼ -0.50SYP (new) -0.35% Day Range ..."
+static bool parseText(const char* t, Quote& q) {
+  q = Quote();
+  const char* e = t;
+
+  const char* p = strstr(t, "Buy");
+  if (!p) return false;
+  q.buy = numberAfter(p + 3, &e);
+  if (isnan(q.buy)) return false;
+
+  p = strstr(e, "Sell");
+  if (!p) return false;
+  q.sell = numberAfter(p + 4, &e);
+  if (isnan(q.sell)) return false;
+
+  q.market = findMarket(t);
+
+  p = strstr(e, "Change");
+  if (p) {
+    const char* pp = nullptr;                       // the '%' sign of the daily change
+    for (int i = 0; i < 120 && p[i]; i++) if (p[i] == '%') { pp = p + i; break; }
+    if (pp) {
+      const char* ne = pp;
+      while (ne > p && ne[-1] == ' ') ne--;
+      const char* n0 = ne;
+      while (n0 > p && (isdigit((unsigned char)n0[-1]) || n0[-1] == '.')) n0--;
+      float v = (float)atof(n0);
+
+      int8_t sign = 0;
+      if (n0 > p) {
+        if (n0[-1] == '-') sign = -1;
+        else if (n0[-1] == '+') sign = 1;
+        else if (n0 - p >= 3 && memcmp(n0 - 3, "\xE2\x88\x92", 3) == 0) sign = -1;   // U+2212 minus
+      }
+      if (sign == 0) {                              // no +/- sign: look for the arrow
+        char seg[48];
+        size_t L = (size_t)(n0 - p);
+        if (L > sizeof(seg) - 1) L = sizeof(seg) - 1;
+        memcpy(seg, p, L);
+        seg[L] = 0;
+        if (hasUp(seg)) sign = 1;
+        else if (hasDown(seg)) sign = -1;
+      }
+
+      if (v == 0.0f)       { q.pct = 0; q.dir = 0;    q.dirFound = true; }
+      else if (sign != 0)  { q.pct = sign * v; q.dir = sign; q.dirFound = true; }
+      // else: number without any direction -> pct stays NAN, dirFound false
+    }
+  }
+  return true;
+}
+
+// Receives the HTML stream, drops tags/<script>/<style>, keeps visible text only.
+class PageSink : public Stream {
+ public:
+  static const size_t TXT_MAX = 1800;
+  char   txt[TXT_MAX];
+  size_t n = 0;
+  bool   full = false;
+
+  void reset() {
+    n = 0; txt[0] = 0; full = false;
+    st = ST_TEXT; tagLen = 0; nameDone = false; quote = 0; skipEnd = nullptr; tailLen = 0;
+  }
+
+  int    available() override { return 0; }
+  int    read() override { return -1; }
+  int    peek() override { return -1; }
+  size_t write(uint8_t c) override { feed(c); return full ? 0 : 1; }   // 0 => stop downloading
+  size_t write(const uint8_t* b, size_t len) override {
+    for (size_t i = 0; i < len; i++) { feed(b[i]); if (full) return 0; }
+    return len;
+  }
+
+ private:
+  enum State { ST_TEXT, ST_TAG, ST_SKIP };
+  State       st = ST_TEXT;
+  char        tagName[8];
+  uint8_t     tagLen = 0;
+  bool        nameDone = false;
+  char        quote = 0;
+  const char* skipEnd = nullptr;
+  char        tail[10];
+  uint8_t     tailLen = 0;
+
+  bool isComment() const {
+    return tagLen >= 3 && tagName[0] == '!' && tagName[1] == '-' && tagName[2] == '-';
+  }
+  bool tailEndsWith(const char* s) const {
+    uint8_t l = (uint8_t)strlen(s);
+    return tailLen >= l && memcmp(tail + tailLen - l, s, l) == 0;
+  }
+  void beginSkip(const char* endTag) { st = ST_SKIP; skipEnd = endTag; tailLen = 0; }
+
+  void addText(uint8_t c) {
+    if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    if (c == ' ' && (n == 0 || txt[n - 1] == ' ')) return;     // collapse spaces
+    txt[n++] = (char)c;
+    txt[n] = 0;
+    if (n >= TXT_MAX - 1) full = true;
+  }
+
+  void feed(uint8_t c) {
+    switch (st) {
+      case ST_TEXT:
+        if (c == '<') { st = ST_TAG; tagLen = 0; nameDone = false; quote = 0; }
+        else addText(c);
+        break;
+
+      case ST_TAG:
+        if (quote) { if (c == (uint8_t)quote) quote = 0; break; }
+        if ((c == '"' || c == '\'') && !isComment()) { quote = (char)c; nameDone = true; break; }
+        if (c == '>') {
+          tagName[tagLen] = 0;
+          st = ST_TEXT;
+          addText(' ');
+          if (strcmp(tagName, "script") == 0)     beginSkip("</script>");
+          else if (strcmp(tagName, "style") == 0) beginSkip("</style>");
+          break;
+        }
+        if (!nameDone) {
+          if (c <= ' ') nameDone = true;
+          else if (tagLen < sizeof(tagName) - 1) tagName[tagLen++] = (char)tolower(c);
+        }
+        break;
+
+      case ST_SKIP:
+        if (tailLen < sizeof(tail)) tail[tailLen++] = (char)tolower(c);
+        else { memmove(tail, tail + 1, sizeof(tail) - 1); tail[sizeof(tail) - 1] = (char)tolower(c); }
+        if (tailEndsWith(skipEnd)) st = ST_TEXT;
+        break;
+    }
+  }
+};
+// ---- PARSER END --------------------------------------------------------
+
+// ===================== HARDWARE / STATE =====================
+LiquidCrystal lcd(PIN_RS, PIN_E, PIN_D4, PIN_D5, PIN_D6, PIN_D7);
+Preferences   prefs;
+PageSink      sink;
+
+byte ARROW_UP[8]   = {0b00100, 0b01110, 0b10101, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000};
+byte ARROW_DOWN[8] = {0b00100, 0b00100, 0b00100, 0b00100, 0b10101, 0b01110, 0b00100, 0b00000};
+
+Quote  cur;                 // last good quote
+bool   haveData = false;
+int8_t trend = 0;           // last known direction: +1 rising, -1 falling, 0 unknown
+bool   ntpStarted = false;
+int    failCount = 0;
+
+// ===================== NETWORK =====================
+bool connectWiFi(uint32_t timeoutMs = 15000) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) delay(250);
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (!ntpStarted) {                         // Damascus = UTC+3 (no daylight saving)
+    configTzTime("<+03>-3", "pool.ntp.org", "time.google.com");
+    struct tm t;
+    getLocalTime(&t, 4000);                  // wait a moment for the first sync
+    ntpStarted = true;
+  }
+  return true;
+}
+
+bool fetchQuote(Quote& q, char* err, size_t errLen) {
+  WiFiClientSecure client;
+  client.setInsecure();                      // public data only; no certificate check
+
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(10000);
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
+  if (!http.begin(client, PAGE_URL)) { snprintf(err, errLen, "begin"); return false; }
+  http.addHeader("Accept", "text/html");
+  http.addHeader("Accept-Language", "en");
+  http.addHeader("Accept-Encoding", "identity");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    snprintf(err, errLen, "HTTP %d", code);
+    http.end();
+    return false;
+  }
+
+  sink.reset();
+  http.writeToStream(&sink);                 // stops by itself once enough text was read
+  http.end();
+
+  if (!parseText(sink.txt, q)) {
+    snprintf(err, errLen, "parse");
+    Serial.println(F("--- text seen by ESP32 (for debugging) ---"));
+    Serial.println(sink.txt);
+    return false;
+  }
+  return true;
+}
+
+// ===================== LOGIC =====================
+void updateTrend(const Quote& q) {
+  static float prevSell = NAN;
+  int8_t t = trend;
+  if (q.dirFound) {
+    if (q.dir != 0) t = q.dir;               // change = 0 -> keep the last direction
+  } else if (!isnan(prevSell) && q.sell != prevSell) {
+    t = (q.sell > prevSell) ? 1 : -1;        // fallback only if the page shows no direction
+  }
+  prevSell = q.sell;
+  if (t != trend) { trend = t; prefs.putChar("trend", trend); }
+}
+
+int8_t timeMarket() {                         // fallback: working hours in Damascus
+  struct tm t;
+  if (!getLocalTime(&t, 100)) return -1;
+  return (t.tm_hour >= MARKET_OPEN_HOUR && t.tm_hour < MARKET_CLOSE_HOUR) ? 1 : 0;
+}
+
+void setLeds() {
+  digitalWrite(PIN_LED_GREEN, trend > 0 ? HIGH : LOW);
+  digitalWrite(PIN_LED_RED,   trend < 0 ? HIGH : LOW);
+}
+
+// ===================== DISPLAY =====================
+void fmtPrice(float v, char* out, size_t n) {
+  if (SHOW_OLD_LIRA) snprintf(out, n, "%ld", lroundf(v * 100.0f));
+  else               snprintf(out, n, "%.2f", v);
+}
+
+void padPrint(const char* s) {
+  char b[17];
+  snprintf(b, sizeof b, "%-16s", s);
+  lcd.print(b);
+}
+
+void draw(bool ok, int8_t mk, const char* err) {
+  if (!haveData) {
+    lcd.setCursor(0, 0); padPrint("No data yet");
+    lcd.setCursor(0, 1); padPrint(err);
+    return;
+  }
+
+  char b[12], s[12], l0[24], row0[17], l1[24], pc[12];
+
+  // row 0:  B143.75 S144.50      ('!' at the end = last refresh failed)
+  fmtPrice(cur.buy,  b, sizeof b);
+  fmtPrice(cur.sell, s, sizeof s);
+  snprintf(l0, sizeof l0, "B%s S%s", b, s);
+  snprintf(row0, sizeof row0, "%-16s", l0);
+  if (!ok) row0[15] = '!';
+  lcd.setCursor(0, 0);
+  lcd.print(row0);
+
+  // row 1:  OPEN     +0.35% ^    (market, daily change, arrow)
+  const char* ms = (mk == 1) ? "OPEN" : (mk == 0) ? "CLOSED" : "----";
+  if (isnan(cur.pct)) snprintf(pc, sizeof pc, "--");
+  else                snprintf(pc, sizeof pc, "%+.2f%%", cur.pct);
+  snprintf(l1, sizeof l1, "%-7s%7s ", ms, pc);
+  l1[15] = 0;
+  lcd.setCursor(0, 1);
+  lcd.print(l1);
+  if (trend > 0)      lcd.write((uint8_t)0);   // up arrow
+  else if (trend < 0) lcd.write((uint8_t)1);   // down arrow
+  else                lcd.print('-');
+}
+
+void refresh() {
+  Quote q;
+  char err[16] = "";
+  bool ok = false;
+
+  if (connectWiFi()) ok = fetchQuote(q, err, sizeof err);
+  else               snprintf(err, sizeof err, "WiFi");
+
+  if (ok) {
+    cur = q;
+    haveData = true;
+    updateTrend(q);
+    failCount = 0;
+  } else if (++failCount >= 20) {            // ~10 minutes without data -> restart
+    ESP.restart();
+  }
+
+  int8_t mk = (ok && q.market >= 0) ? q.market : timeMarket();
+  draw(ok, mk, err);
+  setLeds();
+
+  Serial.printf("ok=%d buy=%.2f sell=%.2f pct=%.2f dirFound=%d trend=%d market=%d(site=%d) %s\n",
+                ok, cur.buy, cur.sell, cur.pct, cur.dirFound, trend, mk, ok ? q.market : -9, err);
+}
+
+// ===================== ARDUINO =====================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+
+  prefs.begin("lira", false);
+  trend = prefs.getChar("trend", 0);         // last direction survives a reboot
+  setLeds();
+
+  lcd.begin(16, 2);
+  lcd.createChar(0, ARROW_UP);
+  lcd.createChar(1, ARROW_DOWN);
+  lcd.clear();
+  lcd.print("USD/SYP Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Connecting WiFi");
+}
+
+void loop() {
+  static uint32_t lastRun = 0;
+  static bool first = true;
+  if (first || millis() - lastRun >= REFRESH_MS) {
+    first = false;
+    lastRun = millis();
+    refresh();
+  }
+  delay(50);
+}
